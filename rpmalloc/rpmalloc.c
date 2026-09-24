@@ -930,7 +930,8 @@ ios_va_hex(char* buf, int i, uintptr_t v) {
 
 static void
 ios_fex_band_select(ios_valloc2_t valloc2) {
-	static const uintptr_t cand[][2] = {
+	/* MADEIRA ml1600: not const; cand[1]'s end is widened at runtime below. */
+	static uintptr_t cand[][2] = {
 		/* 512GB regime (iOS 27): the established layout. Must stay clear of
 		 * CEF's four 16GB PartitionAlloc pools at [0x74,0x7c) -- see the ml325
 		 * correction in AllocatorHooks.h. */
@@ -947,6 +948,17 @@ ios_fex_band_select(ios_valloc2_t valloc2) {
 	 * appended into the same buffer before a single emit, so size for the pair. */
 	char buf[512];
 	int i, c;
+
+	/* MADEIRA ml1600: the 64 GB regime's 8 GB slice ran dry under a launcher's
+	 * browser helper (tablet log 207: a new thread's allocations at 0xdf6xxxxxx,
+	 * then FEX wrote through a failed one at 0x1000 and the helper died). It is a
+	 * placement range, not a reservation, so widen it to 12 GB [48 GB, 60 GB),
+	 * still below the end of that map (63 GB). MADEIRA_FEX_ARENA_WIDE=0 keeps 8 GB. */
+	{
+		char v[4];
+		DWORD n = GetEnvironmentVariableA("MADEIRA_FEX_ARENA_WIDE", v, sizeof(v));
+		if (!(n && n < sizeof(v) && v[0] == '0')) cand[1][1] = 0x0effffffffULL;
+	}
 
 	memset(&si, 0, sizeof(si));
 	GetSystemInfo(&si);
