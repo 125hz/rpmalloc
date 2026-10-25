@@ -3083,8 +3083,62 @@ rpmalloc_is_thread_initialized(void) {
 static _Atomic(uintptr_t) fex_ios_rpm_owner;
 static unsigned fex_ios_rpm_depth;
 static int fex_ios_rpm_enabled = -1;
+
+/* Madeira 2026-10-24 [rpm-lock]: A WAITER SLEEPS INSTEAD OF SPINNING.
+ *
+ * ml1044's lock serialises every allocation of the process, and ml1045 made
+ * it unconditional. Its waiters spun (wait_spin: a `yield` loop) for as long as
+ * the holder kept it. A publisher launcher with 85 guest threads, 12 of them
+ * allocating at once, convoyed on it: device log 2026-10-24 18:34 (vk-1024-3),
+ * 135 thread samples of launcher threads at fex_ios_rpm_lock+0x5c with
+ * FEXCore::Allocator::malloc+0x10 as the caller, each at 10-14% of a core for
+ * minutes, while the browser helper's threads yielded and its UI never came up.
+ *
+ * The lock keeps its meaning (one owner, recursive on the owner's thread, no
+ * getenv, nothing that allocates or touches per-thread CRT state) and gains a
+ * sleeping slow path: after a short spin a waiter parks in the kernel on the
+ * lock word (xnu's __ulock_wait, the primitive libpthread's own mutexes use,
+ * issued directly with `svc #0x80` so it needs no TEB, no CRT and no import; the
+ * calling convention is x16 = number, x0..x3 = arguments) and the release wakes
+ * one sleeper (__ulock_wake) only when the word says somebody sleeps. The wait is
+ * bounded (20 ms) and every wake-up re-checks the word, so a missed wake costs a
+ * pause, never a hang. The lock word is separate from the owner word: the owner
+ * word stays what the recursion check reads; the lock word is the three-state
+ * futex mutex (0 free, 1 held, 2 held with sleepers). FEX_IOS_RPM_SPIN_ONLY
+ * builds the previous spin-only wait. */
+#ifndef FEX_IOS_RPM_SPIN
+#define FEX_IOS_RPM_SPIN 64            /* yields before sleeping: an uncontended or briefly held lock never sleeps */
+#endif
+#define FEX_IOS_RPM_SLEEP_US 20000     /* the bound on one sleep; wake-ups re-check the word */
+#define FEX_IOS_UL_COMPARE_AND_WAIT 1u /* xnu sys/ulock.h */
+#define FEX_IOS_ULF_NO_ERRNO 0x01000000u
+static _Atomic(uint32_t) fex_ios_rpm_state;   /* 0 free, 1 held, 2 held with sleepers */
+static _Atomic(uint64_t) fex_ios_rpm_sleeps;  /* diagnostics: sleeps taken, wakes sent */
+static _Atomic(uint64_t) fex_ios_rpm_wakes;
+
+#ifndef FEX_IOS_RPM_SPIN_ONLY
+/* int __ulock_wait(uint32_t operation, void *addr, uint64_t value, uint32_t timeout_us): syscall 515.
+ * int __ulock_wake(uint32_t operation, void *addr, uint64_t wake_value): syscall 516.
+ * Both with ULF_NO_ERRNO return a negative errno in x0 instead of setting the carry. */
+__attribute__((naked, noinline)) static long
+fex_ios_ulock_wait(uint32_t operation, void *addr, uint64_t value, uint32_t timeout_us) {
+	__asm__ volatile(
+		"mov x16, #515\n"
+		"svc #0x80\n"
+		"ret\n" ::: "memory");
+}
+__attribute__((naked, noinline)) static long
+fex_ios_ulock_wake(uint32_t operation, void *addr, uint64_t wake_value) {
+	__asm__ volatile(
+		"mov x16, #516\n"
+		"svc #0x80\n"
+		"ret\n" ::: "memory");
+}
+#endif
+
 void fex_ios_rpm_lock(void) {
-	uintptr_t self, expected = 0;
+	uintptr_t self;
+	uint32_t c = 0;
 	/* ml1045: NO getenv() HERE. ml1044 read an off-switch from the environment on
 	 * first use, and the first use is during early thread setup -- before the CRT
 	 * is usable on that thread (x18 was still 0). Calling into ucrtbase from there
@@ -3096,17 +3150,53 @@ void fex_ios_rpm_lock(void) {
 	fex_ios_rpm_enabled = 1;
 	self = get_thread_id() | 1;
 	if (atomic_load_explicit(&fex_ios_rpm_owner, memory_order_acquire) == self) { ++fex_ios_rpm_depth; return; }
-	while (!atomic_compare_exchange_weak_explicit(&fex_ios_rpm_owner, &expected, self, memory_order_acquire,
-	                                              memory_order_relaxed)) {
-		expected = 0;
-		wait_spin();
+	if (!atomic_compare_exchange_strong_explicit(&fex_ios_rpm_state, &c, 1, memory_order_acquire, memory_order_relaxed)) {
+		unsigned spins = 0;
+		while (spins++ < FEX_IOS_RPM_SPIN) {
+			wait_spin();
+			c = 0;
+			if (atomic_compare_exchange_strong_explicit(&fex_ios_rpm_state, &c, 1, memory_order_acquire, memory_order_relaxed))
+				goto taken;
+		}
+#ifdef FEX_IOS_RPM_SPIN_ONLY
+		for (;;) {
+			c = 0;
+			if (atomic_compare_exchange_strong_explicit(&fex_ios_rpm_state, &c, 1, memory_order_acquire, memory_order_relaxed))
+				break;
+			wait_spin();
+		}
+#else
+		/* the three-state mutex: announce a sleeper, sleep while the word says held, take it as 2 */
+		if (c != 2) c = atomic_exchange_explicit(&fex_ios_rpm_state, 2, memory_order_acquire);
+		while (c != 0) {
+			atomic_fetch_add_explicit(&fex_ios_rpm_sleeps, 1, memory_order_relaxed);
+			fex_ios_ulock_wait(FEX_IOS_UL_COMPARE_AND_WAIT | FEX_IOS_ULF_NO_ERRNO, (void *)&fex_ios_rpm_state, 2,
+			                   FEX_IOS_RPM_SLEEP_US);
+			c = atomic_exchange_explicit(&fex_ios_rpm_state, 2, memory_order_acquire);
+		}
+#endif
 	}
+taken:
+	atomic_store_explicit(&fex_ios_rpm_owner, self, memory_order_release);
 	fex_ios_rpm_depth = 1;
 }
 void fex_ios_rpm_unlock(void) {
 	if (fex_ios_rpm_enabled <= 0) return;
 	if (atomic_load_explicit(&fex_ios_rpm_owner, memory_order_acquire) != (get_thread_id() | 1)) return;
-	if (--fex_ios_rpm_depth == 0) atomic_store_explicit(&fex_ios_rpm_owner, 0, memory_order_release);
+	if (--fex_ios_rpm_depth == 0) {
+		atomic_store_explicit(&fex_ios_rpm_owner, 0, memory_order_release);
+		if (atomic_exchange_explicit(&fex_ios_rpm_state, 0, memory_order_release) == 2) {
+#ifndef FEX_IOS_RPM_SPIN_ONLY
+			atomic_fetch_add_explicit(&fex_ios_rpm_wakes, 1, memory_order_relaxed);
+			fex_ios_ulock_wake(FEX_IOS_UL_COMPARE_AND_WAIT | FEX_IOS_ULF_NO_ERRNO, (void *)&fex_ios_rpm_state, 0);
+#endif
+		}
+	}
+}
+/* Read by whoever wants the numbers (a debugger, a future summary line). */
+void fex_ios_rpm_lock_stats(uint64_t *sleeps, uint64_t *wakes) {
+	if (sleeps) *sleeps = atomic_load_explicit(&fex_ios_rpm_sleeps, memory_order_relaxed);
+	if (wakes) *wakes = atomic_load_explicit(&fex_ios_rpm_wakes, memory_order_relaxed);
 }
 #endif
 
